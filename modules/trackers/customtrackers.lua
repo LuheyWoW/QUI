@@ -432,6 +432,10 @@ end
 -- Populated when we can safely read maxCharges (outside combat/untainted)
 local knownChargeSpells = {}
 
+-- Track when charge spells were last cast (spellID -> GetTime())
+-- Used to detect real recharge vs GCD in combat when charge count is secret
+local chargeSpellLastCast = {}
+
 local function GetSpellChargeCount(spellID)
     if not spellID then return 0, 1, 0, 0 end
     local chargeInfo = C_Spell.GetSpellCharges(spellID)
@@ -1471,39 +1475,47 @@ function CustomTrackers:StartCooldownPolling(bar)
 
                         isOnCD = mainCDActive
 
-                        -- Exclude GCD from rechargeActive for visibility purposes
-                        -- A charge spell is truly recharging only if we're missing charges
-                        -- If we have all charges, any cooldown showing is just GCD
-                        if hideGCD and rechargeActive then
-                            local isDefinitelyGCD = false
+                        -- Clear stale lastCast timestamps when spell is completely ready
+                        -- (no recharge, no GCD = full charges, ready to cast)
+                        if not rechargeActive and not isOnGCD then
+                            chargeSpellLastCast[entry.id] = nil
+                        end
 
-                            -- Method 1: Check if we have ALL charges (count >= maxCharges means GCD)
-                            local chargeCheckOk, chargeCheckResult = pcall(function()
-                                return count >= maxCharges
-                            end)
-                            if chargeCheckOk then
-                                isDefinitelyGCD = chargeCheckResult
-                            else
-                                -- Method 2: Query the cooldown frame's duration directly
-                                -- GCD is ~1.5s, real recharge is longer. If duration <= 2s, it's GCD.
-                                local frameCheckOk, frameDuration = pcall(function()
-                                    return icon.cooldown:GetCooldownDuration()
+                        -- Exclude GCD from rechargeActive for visibility purposes
+                        -- Use isOnGCD from MAIN spell cooldown (not secret) to detect GCD
+                        if hideGCD and rechargeActive then
+                            if isOnGCD then
+                                -- Main spell is on GCD. Could be just GCD (full charges) or
+                                -- real recharge that started during GCD. Try to check charges.
+                                local chargeCheckOk, hasMissingCharges = pcall(function()
+                                    return count < maxCharges
                                 end)
-                                if frameCheckOk and frameDuration then
-                                    -- Duration might also be secret, wrap comparison
-                                    local compareOk, compareResult = pcall(function()
-                                        return frameDuration <= 2.0
-                                    end)
-                                    if compareOk then
-                                        isDefinitelyGCD = compareResult
+                                if chargeCheckOk then
+                                    if hasMissingCharges then
+                                        -- We're missing charges = real recharge, keep showing
+                                    else
+                                        -- Full charges confirmed - this is just GCD
+                                        -- Clear stale lastCast timestamp and hide
+                                        chargeSpellLastCast[entry.id] = nil
+                                        rechargeActive = false
+                                    end
+                                else
+                                    -- Can't determine charge count (secret value)
+                                    -- Fall back to checking if this spell was cast recently
+                                    local lastCast = chargeSpellLastCast[entry.id]
+                                    local now = GetTime()
+                                    -- If spell was cast within last 120 seconds, it's likely recharging
+                                    -- (most charge spells have recharge times under 60s, use 120s for safety)
+                                    if lastCast and (now - lastCast) < 120 then
+                                        -- Recently cast = real recharge, keep showing
+                                    else
+                                        -- Not cast recently = this is just GCD from another spell
+                                        rechargeActive = false
                                     end
                                 end
-                                -- If frame duration check fails, default to NOT GCD (show the icon)
                             end
-
-                            if isDefinitelyGCD then
-                                rechargeActive = false
-                            end
+                            -- If isOnGCD = false, main spell not on GCD, so charge
+                            -- cooldown must be real recharge - keep rechargeActive = true
                         end
 
                     else
@@ -2284,8 +2296,15 @@ initFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "UNIT_SPELLCAST_START" or event == "UNIT_SPELLCAST_STOP" or
        event == "UNIT_SPELLCAST_SUCCEEDED" or event == "UNIT_SPELLCAST_CHANNEL_START" or
        event == "UNIT_SPELLCAST_CHANNEL_STOP" then
-        local unit = ...
+        local unit, _, spellID = ...
         if unit == "player" then
+            -- Track charge spell casts for GCD detection
+            if event == "UNIT_SPELLCAST_SUCCEEDED" and spellID then
+                local cachedMaxCharges = knownChargeSpells[spellID]
+                if cachedMaxCharges and cachedMaxCharges > 1 then
+                    chargeSpellLastCast[spellID] = GetTime()
+                end
+            end
             for _, bar in pairs(CustomTrackers.activeBars) do
                 if bar and bar:IsShown() and bar.DoUpdate and bar.config and bar.config.showActiveState ~= false then
                     bar.DoUpdate()
